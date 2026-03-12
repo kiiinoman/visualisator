@@ -1,18 +1,23 @@
 """
-Итоговый скрипт сопоставления хостов и подсетей.
+Сопоставление хостов и подсетей.
+
+Логика:
+  - Каждый хост из host.xlsx сопоставляется с подсетью из subnet.xlsx
+    (ищется наиболее специфичная подсеть, в которую входит IP хоста)
+
+  - unique_hosts   = хосты, для которых НЕ найдена ни одна подсеть в subnet.xlsx
+  - unique_subnets = подсети из subnet.xlsx, в которые НЕ попал ни один хост
 
 Входные файлы:
-    subnet.xlsx  — одна колонка 'subnet' (CIDR, например 10.178.0.0/24)
-    host.xlsx    — одна колонка 'host'   (IP, например 10.178.25.112)
+    subnet.xlsx  — колонка 'subnet'
+    host.xlsx    — колонка 'host'
 
-Результат — result.xlsx с тремя листами:
-    'subnet_hosts'   — подсеть | хосты (через запятую) | кол-во хостов
-    'unique_hosts'   — хосты, не вошедшие ни в одну подсеть
-    'unique_subnets' — подсети, к которым не относится ни один хост
+Результат — result.xlsx:
+    Лист 'subnet_hosts'   — subnet | hosts | кол-во
+    Лист 'unique_hosts'   — хосты без подсети
+    Лист 'unique_subnets' — подсети без хостов
 
-Лог пишется в run.log рядом со скриптом.
-
-Python 3.9+, зависимости: pip install pandas openpyxl
+Python 3.9+  |  pip install pandas openpyxl
 """
 
 import ipaddress
@@ -33,54 +38,42 @@ OUTPUT_FILE = "result.xlsx"
 LOG_FILE    = "run.log"
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Цвета ─────────────────────────────────────────────────────────────────────
 C_HDR_GREEN = "2E7D32"
 C_HDR_BLUE  = "1565C0"
 C_ROW_EVEN  = "F5F5F5"
 C_ROW_ODD   = "FFFFFF"
 C_HAS_HOSTS = "C8E6C9"
 C_NO_HOSTS  = "FFCDD2"
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-# ── Логирование ───────────────────────────────────────────────────────────────
+# ── Логгер ────────────────────────────────────────────────────────────────────
 def setup_logger():
     log = logging.getLogger("make_result")
     log.setLevel(logging.DEBUG)
-
-    fmt = logging.Formatter(
-        fmt="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # В файл — DEBUG и выше (всё)
+    fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8", mode="w")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
-
-    # В консоль — INFO и выше
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
-
     log.addHandler(fh)
     log.addHandler(ch)
     return log
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-def border():
+# ── Стили ─────────────────────────────────────────────────────────────────────
+def _border():
     s = Side(style="thin", color="CCCCCC")
     return Border(left=s, right=s, top=s, bottom=s)
-
 
 def hdr(cell, text, bg=C_HDR_GREEN):
     cell.value = text
     cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     cell.fill = PatternFill("solid", start_color=bg)
     cell.alignment = Alignment(horizontal="center", vertical="center")
-    cell.border = border()
-
+    cell.border = _border()
 
 def dat(cell, value=None, bg=C_ROW_ODD, bold=False):
     if value is not None:
@@ -88,145 +81,143 @@ def dat(cell, value=None, bg=C_ROW_ODD, bold=False):
     cell.font = Font(name="Arial", size=10, bold=bold)
     cell.fill = PatternFill("solid", start_color=bg)
     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    cell.border = border()
+    cell.border = _border()
 
 
+# ── Утилиты ───────────────────────────────────────────────────────────────────
 def read_col(filepath, colname, log):
     # type: (str, str, logging.Logger) -> List[str]
-    log.info("Читаем файл: %s (колонка: %s)" % (filepath, colname))
     if not os.path.exists(filepath):
         log.error("Файл не найден: %s" % filepath)
         raise FileNotFoundError("Файл не найден: %s" % filepath)
-
     df = pd.read_excel(filepath, dtype=str)
     df.columns = df.columns.str.strip()
     log.debug("Колонки в %s: %s" % (filepath, list(df.columns)))
-
     mapping = {c.lower(): c for c in df.columns}
     real = mapping.get(colname.lower())
     if not real:
-        log.error("Колонка '%s' не найдена в %s" % (colname, filepath))
         raise ValueError("Колонка '%s' не найдена в %s. Есть: %s" % (
             colname, filepath, list(df.columns)))
-
     values = df[real].dropna().str.strip().tolist()
-    log.info("Прочитано строк: %d" % len(values))
-    log.debug("Первые 5 значений: %s" % values[:5])
+    log.info("  %s — прочитано строк: %d" % (filepath, len(values)))
     return values
 
-
-def norm(cidr):
-    # type: (str) -> Optional[str]
+def try_network(s):
+    # type: (str) -> Optional[ipaddress.IPv4Network]
     try:
-        return str(ipaddress.ip_network(cidr, strict=False))
+        return ipaddress.ip_network(s, strict=False)
+    except ValueError:
+        return None
+
+def try_ip(s):
+    # type: (str) -> Optional[ipaddress.IPv4Address]
+    try:
+        return ipaddress.ip_address(s)
     except ValueError:
         return None
 
 
+# ── Главная логика ────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 60)
     log.info("Старт  %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 60)
 
-    # ── 1. Подсети ────────────────────────────────────────────────────────────
-    log.info("ШАГ 1/4 — Загрузка подсетей")
+    # ── 1. Загружаем подсети ──────────────────────────────────────────────────
+    log.info("ШАГ 1/4  Загрузка подсетей из %s" % SUBNET_FILE)
     raw_subnets = read_col(SUBNET_FILE, "subnet", log)
-    log.info("Строк в файле (raw): %d" % len(raw_subnets))
 
-    seen = set()
-    subnets = []
-    networks = []
-    bad_subnets = []
+    # Нормализуем и дедуплицируем
+    seen_sn = set()
+    subnets_ordered = []   # List[str]  нормализованные CIDR, уникальные
+    networks_ordered = []  # List[IPv4Network]  в том же порядке
+    skipped_bad = 0
+    skipped_dup = 0
 
     for s in raw_subnets:
-        n = norm(s)
-        if n is None:
-            bad_subnets.append(s)
-            log.warning("Не удалось разобрать подсеть: '%s' — пропускаем" % s)
-        elif n in seen:
-            log.debug("Дубликат подсети пропущен: %s" % n)
-        else:
-            seen.add(n)
-            subnets.append(n)
-            networks.append(ipaddress.ip_network(n))
+        net = try_network(s)
+        if net is None:
+            log.warning("Нераспознанная подсеть пропущена: '%s'" % s)
+            skipped_bad += 1
+            continue
+        key = str(net)
+        if key in seen_sn:
+            log.debug("Дубликат подсети пропущен: %s" % key)
+            skipped_dup += 1
+            continue
+        seen_sn.add(key)
+        subnets_ordered.append(key)
+        networks_ordered.append(net)
 
-    log.info("Уникальных подсетей после дедупликации: %d" % len(subnets))
-    log.info("Дублей удалено: %d" % (len(raw_subnets) - len(bad_subnets) - len(subnets)))
-    if bad_subnets:
-        log.warning("Нераспознанных подсетей: %d -> %s" % (len(bad_subnets), bad_subnets[:10]))
+    log.info("  Строк raw:              %d" % len(raw_subnets))
+    log.info("  Нераспознанных:         %d" % skipped_bad)
+    log.info("  Дублей удалено:         %d" % skipped_dup)
+    log.info("  Уникальных подсетей:    %d" % len(subnets_ordered))
 
-    # ── 2. Хосты ─────────────────────────────────────────────────────────────
-    log.info("ШАГ 2/4 — Загрузка хостов")
+    # ── 2. Загружаем хосты ───────────────────────────────────────────────────
+    log.info("ШАГ 2/4  Загрузка хостов из %s" % HOST_FILE)
     raw_hosts = read_col(HOST_FILE, "host", log)
-    log.info("Строк в файле (raw): %d" % len(raw_hosts))
 
-    hosts = list(dict.fromkeys(raw_hosts))
-    dup_hosts = len(raw_hosts) - len(hosts)
-    log.info("Уникальных хостов после дедупликации: %d" % len(hosts))
-    if dup_hosts:
-        log.info("Дублей хостов удалено: %d" % dup_hosts)
+    seen_h = set()
+    hosts = []
+    for h in raw_hosts:
+        if h not in seen_h:
+            seen_h.add(h)
+            hosts.append(h)
 
-    bad_ip_hosts = []
-    for h in hosts:
-        try:
-            ipaddress.ip_address(h)
-        except ValueError:
-            bad_ip_hosts.append(h)
-    if bad_ip_hosts:
-        log.warning("Невалидных IP в host.xlsx: %d -> %s" % (len(bad_ip_hosts), bad_ip_hosts[:10]))
+    log.info("  Строк raw:              %d" % len(raw_hosts))
+    log.info("  Дублей удалено:         %d" % (len(raw_hosts) - len(hosts)))
+    log.info("  Уникальных хостов:      %d" % len(hosts))
 
     # ── 3. Сопоставление ─────────────────────────────────────────────────────
-    log.info("ШАГ 3/4 — Сопоставление хостов к подсетям")
+    log.info("ШАГ 3/4  Сопоставление хостов -> подсети")
 
-    subnet_to_hosts = {s: [] for s in subnets}  # type: Dict[str, List[str]]
+    # subnet_str -> [host, ...]
+    subnet_to_hosts = {s: [] for s in subnets_ordered}  # type: Dict[str, List[str]]
     unique_hosts = []
 
     for host in hosts:
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            log.debug("Невалидный IP, пропускаем: %s" % host)
+        ip = try_ip(host)
+        if ip is None:
+            log.warning("Невалидный IP пропущен: '%s'" % host)
             unique_hosts.append(host)
             continue
 
-        best = None
+        best_net = None
         best_prefix = -1
-        for net, cidr_str in zip(networks, subnets):
+        for net, cidr in zip(networks_ordered, subnets_ordered):
             if ip in net and net.prefixlen > best_prefix:
-                best = cidr_str
+                best_net = cidr
                 best_prefix = net.prefixlen
 
-        if best:
-            subnet_to_hosts[best].append(host)
-            log.debug("HOST %s -> SUBNET %s" % (host, best))
+        if best_net:
+            subnet_to_hosts[best_net].append(host)
+            log.debug("  %s  ->  %s" % (host, best_net))
         else:
             unique_hosts.append(host)
-            log.debug("HOST %s -> не найдена подсеть" % host)
+            log.debug("  %s  ->  [нет подсети]" % host)
 
-    matched_subnets = [s for s in subnets if subnet_to_hosts[s]]
-    unique_subnets  = [s for s in subnets if not subnet_to_hosts[s]]
+    # Подсети с хостами и без
+    matched_subnets = [s for s in subnets_ordered if subnet_to_hosts[s]]
+    unique_subnets  = [s for s in subnets_ordered if not subnet_to_hosts[s]]
 
-    log.info("Результат сопоставления:")
-    log.info("  Подсетей всего:              %d" % len(subnets))
-    log.info("  Подсетей с хостами:          %d" % len(matched_subnets))
-    log.info("  Подсетей без хостов:         %d" % len(unique_subnets))
-    log.info("  Хостов всего:                %d" % len(hosts))
-    log.info("  Хостов сопоставлено:         %d" % (len(hosts) - len(unique_hosts)))
-    log.info("  Хостов без подсети:          %d" % len(unique_hosts))
+    log.info("  Хостов сопоставлено:    %d / %d" % (len(hosts) - len(unique_hosts), len(hosts)))
+    log.info("  Хостов без подсети:     %d  -> лист unique_hosts" % len(unique_hosts))
+    log.info("  Подсетей с хостами:     %d" % len(matched_subnets))
+    log.info("  Подсетей без хостов:    %d  -> лист unique_subnets" % len(unique_subnets))
 
-    # Топ подсетей по кол-ву хостов
-    top = sorted(matched_subnets, key=lambda s: len(subnet_to_hosts[s]), reverse=True)[:10]
-    log.info("Топ-10 подсетей по кол-ву хостов:")
-    for s in top:
-        log.info("  %-25s -> %d хостов" % (s, len(subnet_to_hosts[s])))
+    # Топ-10 подсетей
+    top10 = sorted(matched_subnets, key=lambda s: len(subnet_to_hosts[s]), reverse=True)[:10]
+    log.info("  Топ-10 подсетей по кол-ву хостов:")
+    for s in top10:
+        log.info("    %-25s  %d хостов" % (s, len(subnet_to_hosts[s])))
 
-    # ── 4. Запись файла ───────────────────────────────────────────────────────
-    log.info("ШАГ 4/4 — Запись %s" % OUTPUT_FILE)
-
+    # ── 4. Запись ─────────────────────────────────────────────────────────────
+    log.info("ШАГ 4/4  Запись %s" % OUTPUT_FILE)
     wb = Workbook()
 
-    # Лист 1: subnet_hosts
+    # Лист 1 — subnet_hosts (все подсети из subnet.xlsx)
     ws1 = wb.active
     ws1.title = "subnet_hosts"
     hdr(ws1.cell(1, 1), "subnet",        C_HDR_GREEN)
@@ -236,35 +227,31 @@ def main():
     ws1.column_dimensions["B"].width = 60
     ws1.column_dimensions["C"].width = 16
     ws1.row_dimensions[1].height = 22
+    for row, s in enumerate(subnets_ordered, start=2):
+        hl = subnet_to_hosts[s]
+        bg = C_HAS_HOSTS if hl else C_NO_HOSTS
+        dat(ws1.cell(row, 1), s,                              bg=bg)
+        dat(ws1.cell(row, 2), ", ".join(hl) if hl else "",    bg=bg)
+        dat(ws1.cell(row, 3), len(hl),                        bg=bg, bold=bool(hl))
+    log.info("  Лист 'subnet_hosts'   записан: %d строк" % len(subnets_ordered))
 
-    for row, s in enumerate(subnets, start=2):
-        h_list = subnet_to_hosts[s]
-        bg = C_HAS_HOSTS if h_list else C_NO_HOSTS
-        dat(ws1.cell(row, 1), s,                                    bg=bg)
-        dat(ws1.cell(row, 2), ", ".join(h_list) if h_list else "",  bg=bg)
-        dat(ws1.cell(row, 3), len(h_list),                          bg=bg, bold=bool(h_list))
-
-    log.info("Лист 'subnet_hosts' записан: %d строк" % len(subnets))
-
-    # Лист 2: unique_hosts
+    # Лист 2 — unique_hosts
     ws2 = wb.create_sheet("unique_hosts")
-    hdr(ws2.cell(1, 1), "host (не входит ни в одну подсеть)", C_HDR_BLUE)
-    ws2.column_dimensions["A"].width = 30
+    hdr(ws2.cell(1, 1), "host (нет в subnet.xlsx)", C_HDR_BLUE)
+    ws2.column_dimensions["A"].width = 25
     ws2.row_dimensions[1].height = 22
     for i, h in enumerate(unique_hosts, start=2):
         dat(ws2.cell(i, 1), h, bg=C_ROW_EVEN if i % 2 == 0 else C_ROW_ODD)
+    log.info("  Лист 'unique_hosts'   записан: %d строк" % len(unique_hosts))
 
-    log.info("Лист 'unique_hosts' записан: %d строк" % len(unique_hosts))
-
-    # Лист 3: unique_subnets
+    # Лист 3 — unique_subnets
     ws3 = wb.create_sheet("unique_subnets")
     hdr(ws3.cell(1, 1), "subnet (нет ни одного хоста)", C_HDR_BLUE)
     ws3.column_dimensions["A"].width = 25
     ws3.row_dimensions[1].height = 22
     for i, s in enumerate(unique_subnets, start=2):
         dat(ws3.cell(i, 1), s, bg=C_ROW_EVEN if i % 2 == 0 else C_ROW_ODD)
-
-    log.info("Лист 'unique_subnets' записан: %d строк" % len(unique_subnets))
+    log.info("  Лист 'unique_subnets' записан: %d строк" % len(unique_subnets))
 
     wb.save(OUTPUT_FILE)
     log.info("Файл сохранён: %s" % OUTPUT_FILE)
@@ -273,10 +260,10 @@ def main():
     log.info("=" * 60)
 
     print("\n✓ Готово! %s" % OUTPUT_FILE)
-    print("  Лист 'subnet_hosts'   — %d подсетей (%d с хостами)" % (len(subnets), len(matched_subnets)))
-    print("  Лист 'unique_hosts'   — %d хостов без подсети" % len(unique_hosts))
-    print("  Лист 'unique_subnets' — %d подсетей без хостов" % len(unique_subnets))
-    print("  Подробный лог:          %s" % LOG_FILE)
+    print("  subnet_hosts   — %d подсетей (%d с хостами)" % (len(subnets_ordered), len(matched_subnets)))
+    print("  unique_hosts   — %d хостов без подсети" % len(unique_hosts))
+    print("  unique_subnets — %d подсетей без хостов" % len(unique_subnets))
+    print("  Лог:             %s" % LOG_FILE)
 
 
 if __name__ == "__main__":
