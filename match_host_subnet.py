@@ -16,6 +16,7 @@
     - result.xlsx  — три колонки: host | subnet | match_status
 """
 
+from typing import Optional, List
 import ipaddress
 import pandas as pd
 from openpyxl import load_workbook
@@ -33,7 +34,7 @@ HOST_COL    = "host"          # название колонки в host.xlsx
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def load_data(filepath: str, column: str) -> list[str]:
+def load_data(filepath: str, column: str) -> list:
     """Читает xlsx и возвращает список значений из указанной колонки."""
     df = pd.read_excel(filepath, dtype=str)
     df.columns = df.columns.str.strip()
@@ -43,7 +44,7 @@ def load_data(filepath: str, column: str) -> list[str]:
     return df[column].dropna().str.strip().tolist()
 
 
-def find_subnet(ip_str: str, networks: list) -> str | None:
+def find_subnet(ip_str: str, networks: list) -> Optional[str]:
     """Возвращает наиболее узкую подсеть, которой принадлежит IP."""
     try:
         ip = ipaddress.ip_address(ip_str)
