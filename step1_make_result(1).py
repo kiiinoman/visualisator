@@ -191,7 +191,15 @@ def main():
 
     # Подсети, у которых нет ни одного совпавшего хоста
     matched_subnets = set(subnet for _, subnet, status in rows if subnet)
-    unique_subnets = [s for s in subnet_strs if str(ipaddress.ip_network(s, strict=False)) not in matched_subnets]
+    # Дедупликация подсетей с сохранением порядка перед сравнением
+    seen_sn = set()
+    deduped_subnets = []
+    for s in subnet_strs:
+        norm = str(ipaddress.ip_network(s, strict=False))
+        if norm not in seen_sn:
+            seen_sn.add(norm)
+            deduped_subnets.append(norm)
+    unique_subnets = [s for s in deduped_subnets if s not in matched_subnets]
 
     print("      Сопоставлено: %d / %d" % (matched_count, len(hosts)))
     print("      Уникальных хостов (без подсети): %d" % len(unique_hosts))
